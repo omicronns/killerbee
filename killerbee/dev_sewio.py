@@ -13,11 +13,9 @@ import os
 import time
 import struct
 import time
-try:
-    import urllib.request as urllib2
-except ImportError:
-    import urllib2
+import urllib.request
 import re
+import binascii
 from socket import socket, AF_INET, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, timeout as error_timeout
 from struct import unpack
 
@@ -27,7 +25,7 @@ from .kbutils import KBCapabilities, makeFCS, isIpAddr, KBInterfaceError
 DEFAULT_IP = "10.10.10.2"   #IP address of the sniffer
 DEFAULT_GW = "10.10.10.1"   #IP address of the default gateway
 DEFAULT_UDP = 17754         #"Remote UDP Port"
-TESTED_FW_VERS = ["0.5"]    #Firmware versions tested with the current version of this client device connector
+TESTED_FW_VERS = ["0.5", "0.9.0"]    #Firmware versions tested with the current version of this client device connector
 
 NTP_DELTA = 70*365*24*60*60 #datetime(1970, 1, 1, 0, 0, 0) - datetime(1900, 1, 1, 0, 0, 0)
 
@@ -54,7 +52,7 @@ def ntp_to_system_time(secs, msecs):
 def getFirmwareVersion(ip):
     try:
         html = urllib.request.urlopen("http://{0}/".format(ip))
-        fw = re.search(r'Firmware version ([0-9.]+)', html.read())
+        fw = re.search(r'removeSSItag\(.*,([0-9.]+)\'', html.read().decode())
         if fw is not None:
             return fw.group(1)
     except Exception as e:
@@ -69,7 +67,7 @@ def getMacAddr(ip):
         html = urllib.request.urlopen("http://{0}/".format(ip))
         # Yup, we're going to have to steal the status out of a JavaScript variable
         #var values = removeSSItag('<!--#pindex-->STOPPED,00:1a:b6:00:0a:a4,...
-        res = re.search(r'<!--#pindex-->[A-Z]+,((?:[0-9a-f]{2}:){5}[0-9a-f]{2})', html.read())
+        res = re.search(r'<!--#pindex-->[A-Z]+,((?:[0-9a-f]{2}:){5}[0-9a-f]{2})', html.read().decode())
         if res is None:
             raise KBInterfaceError("Unable to parse the sniffer's MAC address.")
         return res.group(1)
@@ -134,6 +132,7 @@ class SEWIO:
         @return: None
         '''
         self.capabilities.setcapab(KBCapabilities.SNIFF, True)
+        self.capabilities.setcapab(KBCapabilities.INJECT, True)
         self.capabilities.setcapab(KBCapabilities.SETCHAN, True)
         self.capabilities.setcapab(KBCapabilities.FREQ_2400, True)
         self.capabilities.setcapab(KBCapabilities.FREQ_900, True)
@@ -158,7 +157,7 @@ class SEWIO:
         try:
             html = urllib.request.urlopen("http://{0}/{1}".format(self.dev, path))
             if fetch:
-                return html.read()
+                return html.read().decode()
             else:
                 return (html.getcode() == 200)
         except Exception as e:
@@ -300,9 +299,34 @@ class SEWIO:
     # KillerBee expects the driver to implement this function
     def inject(self, packet, channel=None, count=1, delay=0, page=0):
         '''
-        Not implemented.
+        Injects the specified packet contents.
+        @type packet: String
+        @param packet: Packet contents to transmit, without FCS.
+        @type channel: Integer
+        @param channel: Sets the channel, optional
+        @type page: Integer
+        @param page: Sets the subghz channel, not supported on this device
+        @type count: Integer
+        @param count: Transmits a specified number of frames, def=1
+        @type delay: Float
+        @param delay: Delay between each frame, def=1
+        @rtype: None
         '''
         self.capabilities.require(KBCapabilities.INJECT)
+
+        if len(packet) < 1:
+            raise Exception('Empty packet')
+        if len(packet) > 125:                   # 127 - 2 to accommodate FCS
+            raise Exception('Packet too long')
+
+        if channel == None:
+            channel = self.__sniffer_channel()
+
+        for pnum in range(count):
+            params = "chn={}&modul=0&txlevel=0&rxen=0&nrepeat={}&tspace=1&autocrc=1&spayload={}&len={}".format(
+                channel, count, binascii.hexlify(packet).decode(), len(packet))
+            self.__make_rest_call('inject.cgi?{}'.format(params))
+            time.sleep(delay)
 
     @staticmethod
     def __parse_zep_v2(data):
@@ -350,8 +374,8 @@ class SEWIO:
             # A length vs len(frame) check is not used here but is an 
             #  additional way to verify that all is good (length == len(frame)).
             if crcmode == 0:
-                validcrc = ((ord(data[-1]) & 0x80) == 0x80)
-                rssi = ord(data[-2])
+                validcrc = ((data[-1] & 0x80) == 0x80)
+                rssi = data[-2]
                 # We have to trust the sniffer that the FCS was OK, so we compute
                 #  what a good FCS should be and patch it back into the packet.
                 frame = frame[:-2] + makeFCS(frame[:-2])
